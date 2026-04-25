@@ -5,6 +5,15 @@
 
 TOOL_DIR =
 MODULE	 = ak-flash
+
+# Firmware path and device
+FW_PATH  = firmware_test/ak-base-kit-stm32l151-application.bin
+dev = /dev/ttyUSB0
+APP_START_ADDR_VAL = 0x08003000
+
+# USB rules
+USB_RULES_FILE = usb_rules/uart_usb_conf.rules
+
 OPTIMIZE = -g -Os
 CXX	 = g++
 CC	 = gcc
@@ -19,6 +28,7 @@ VPATH += sources
 
 OBJ += $(OBJ_DIR)/uart_boot.o
 OBJ += $(OBJ_DIR)/firmware.o
+OBJ += $(OBJ_DIR)/app_dbg.o
 
 # CXX compiler option
 CXXFLAGS	+=$(OPTIMIZE)		\
@@ -58,10 +68,19 @@ $(OBJ_DIR)/$(MODULE): $(OBJ)
 	$(CXX) -o $@ $^ $(CXXFLAGS) $(LDFLAGS) $(LDLIBS)
 
 flash:
-	@$(OBJ_DIR)/$(MODULE)
+	@echo $(OBJ_DIR)/$(MODULE) $(dev) $(FW_PATH) $(APP_START_ADDR_VAL)
+	@echo Flashing firmware to device $(dev) at address $(APP_START_ADDR_VAL)
+	@$(OBJ_DIR)/$(MODULE) $(dev) $(FW_PATH) $(APP_START_ADDR_VAL)
 
-install:
+install: usb-rules
+	@echo "Installing $(MODULE) to /usr/local/bin/..."
 	@cp $(OBJ_DIR)/$(MODULE) /usr/local/bin/
+
+usb-rules: 
+	@echo "Installing USB rules for UART device..."
+	@cp $(USB_RULES_FILE) /etc/udev/rules.d/
+	@udevadm control --reload-rules
+	@udevadm trigger
 
 clean:
 	@echo rm -rf $(OBJ_DIR)

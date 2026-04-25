@@ -27,10 +27,11 @@
 
 #include "uart_boot.h"
 #include "firmware.h"
+#include "app_dbg.h"
 
 using namespace std;
 
-//#define FRAME_DEBUG_EN
+#define FRAME_DEBUG_EN
 //#define CHECK_CONFICT_DEVICE_EN
 
 #define CLOCKID					CLOCK_REALTIME
@@ -47,6 +48,98 @@ typedef struct {
 	int transfer;
 } transfer_fw_status_t;
 
+typedef enum {
+	FLASH_STATE_IDLE = 0,
+	FLASH_STATE_PREPARE_FIRMWARE,
+	FLASH_STATE_OPEN_UART,
+	FLASH_STATE_HANDSHAKE,
+	FLASH_STATE_ERASE_FLASH,
+	FLASH_STATE_TRANSFER_FIRMWARE,
+	FLASH_STATE_VERIFY_CHECKSUM,
+	FLASH_STATE_COMPLETE,
+	FLASH_STATE_FAILED
+} flash_state_t;
+
+#define FLASH_TOTAL_STEPS 7
+
+static volatile flash_state_t current_flash_state = FLASH_STATE_IDLE;
+
+#define BLUE_BOLD "\x1b[1;34m"
+#define RED_BOLD "\x1b[1;31m"
+#define COLOR_RESET "\x1b[0m"
+
+static int flash_state_to_step(flash_state_t state) {
+	switch (state) {
+	case FLASH_STATE_PREPARE_FIRMWARE:
+		return 1;
+	case FLASH_STATE_OPEN_UART:
+		return 2;
+	case FLASH_STATE_HANDSHAKE:
+		return 3;
+	case FLASH_STATE_ERASE_FLASH:
+		return 4;
+	case FLASH_STATE_TRANSFER_FIRMWARE:
+		return 5;
+	case FLASH_STATE_VERIFY_CHECKSUM:
+		return 6;
+	case FLASH_STATE_COMPLETE:
+		return 7;
+	default:
+		return 0;
+	}
+}
+
+static const char* flash_state_to_string(flash_state_t state) {
+	switch (state) {
+	case FLASH_STATE_IDLE:
+		return "IDLE";
+	case FLASH_STATE_PREPARE_FIRMWARE:
+		return "PREPARE FIRMWARE";
+	case FLASH_STATE_OPEN_UART:
+		return "OPEN UART";
+	case FLASH_STATE_HANDSHAKE:
+		return "HANDSHAKE";
+	case FLASH_STATE_ERASE_FLASH:
+		return "ERASE FLASH";
+	case FLASH_STATE_TRANSFER_FIRMWARE:
+		return "TRANSFER FIRMWARE";
+	case FLASH_STATE_VERIFY_CHECKSUM:
+		return "VERIFY CHECKSUM";
+	case FLASH_STATE_COMPLETE:
+		return "COMPLETE";
+	case FLASH_STATE_FAILED:
+		return "FAILED";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static void flash_set_state(flash_state_t next_state, const char* message) {
+	if (current_flash_state == next_state) {
+		return;
+	}
+
+	current_flash_state = next_state;
+
+	if (next_state == FLASH_STATE_FAILED) {
+		if (message != NULL) {
+			printf(RED_BOLD "[FAILED] %s\n" COLOR_RESET, message);
+		}
+
+		fflush(stdout);
+		return;
+	}
+
+	if (message != NULL) {
+		printf(BLUE_BOLD "[%d/%d] %s: %s\n" COLOR_RESET, flash_state_to_step(next_state), FLASH_TOTAL_STEPS, flash_state_to_string(next_state), message);
+	}
+	else {
+		printf(BLUE_BOLD "[%d/%d] %s\n" COLOR_RESET, flash_state_to_step(next_state), FLASH_TOTAL_STEPS, flash_state_to_string(next_state));
+	}
+
+	fflush(stdout);
+}
+
 uint8_t frame_SYSTEM_AK_FLASH_UPDATE_REQ[] = { \
 	/* header */
 	0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x68, 0x32, 0xC2, \
@@ -57,7 +150,7 @@ uint8_t frame_SYSTEM_AK_FLASH_UPDATE_REQ[] = { \
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, };
 
 /* help string */
-static string help_string("ak_flash /dev/ttyUSB0 ak-base-kit-stm32l151-application.bin 0x08003000");
+static string help_string("Help: ak_flash /dev/ttyUSB0 ak-base-kit-stm32l151-application.bin 0x08003000");
 
 /* firmware file */
 static string firmware_path;
@@ -100,7 +193,7 @@ static void uart_boot_clear_to();
 #define UART_BOOT_CMD_TRANSFER_FW_REQ_SIG_INTERVAL	2
 #define UART_BOOT_CMD_CHECKSUM_FW_REQ_SIG_INTERVAL	5
 
-#define HANDSHAKE_REQ_RETRY_COUNTER_MAX				5 /* ~ 10s */
+#define HANDSHAKE_REQ_RETRY_COUNTER_MAX				3 /* ~ 6s */
 
 static void uart_boot_cmd_handshake_req(void*);
 static void uart_boot_cmd_handshake_res(void*);
@@ -127,40 +220,45 @@ static uint32_t handshake_req_retry_counter;
 int main(int argc, char *argv[]) {
 #if 0
 	for (int i = 0; i < argc; i++) {
-		cout << "argv[" << i << "]" << argv[i] << endl;
+		APP_DBG(DEBUG_LEVEL_DEBUG, "argv[%d]=%s\n", i, argv[i]);
 	}
 #endif
 	if (argc < 4) {
-		cout << "[ERR] " << "please check parameter" << endl;
-		cout << help_string << endl;
+		flash_set_state(FLASH_STATE_FAILED, "invalid arguments");
+		APP_DBG(DEBUG_LEVEL_ERROR, "invalid arguments: argc=%d\n", argc);
+		APP_DBG(DEBUG_LEVEL_ERROR, "please check parameter\n");
+		APP_DBG(DEBUG_LEVEL_INFO, "%s\n", help_string.c_str());
 		return -1;
 	}
 
 	/***
 	 * command to update firmware:
 	 * host_uart_boot device_path file_path start_flash_address
-	 * example: host_uart_boot /dev/ttyUSB0 build/file_name.bin 0x80002000
+	 * example: host_uart_boot /dev/ttyUSB0 build/file_name.bin 0x80003000
 	 */
 
 	/***
 	 * check firmware file
 	 */
 	firmware_path.assign(argv[2]);
+	flash_set_state(FLASH_STATE_PREPARE_FIRMWARE, "reading firmware info");
 
 	if (firmware_get_info(&file_firmware_header, firmware_path.c_str()) == 0) {
-		cout << "[OK] " << "file_firmware_header.psk		:" << file_firmware_header.psk		<< endl;
-		cout << "[OK] " << "file_firmware_header.bin_len	:" << file_firmware_header.bin_len	<< endl;
-		cout << "[OK] " << "file_firmware_header.checksum	:" << std::hex << file_firmware_header.checksum	<< endl;
+		APP_DBG(DEBUG_LEVEL_INFO, "file_firmware_header.psk        :%u\n", file_firmware_header.psk);
+		APP_DBG(DEBUG_LEVEL_INFO, "file_firmware_header.bin_len    :%u\n", file_firmware_header.bin_len);
+		APP_DBG(DEBUG_LEVEL_INFO, "file_firmware_header.checksum   :0x%04X\n", file_firmware_header.checksum);
 
 		memcpy(&transfer_fw_status.fw_header, &file_firmware_header, sizeof(firmware_header_t));
 	}
 	else {
-		cout << "[ERR] " << "file: " << firmware_path << " is not found." << endl;
+		flash_set_state(FLASH_STATE_FAILED, "firmware is not found or unreadable");
+		APP_DBG(DEBUG_LEVEL_ERROR, "firmware_get_info failed for file=%s\n", firmware_path.c_str());
+		APP_DBG(DEBUG_LEVEL_ERROR, "file: %s is not found.\n", firmware_path.c_str());
 		return -1;
 	}
 
 	target_des_addr = ((uint32_t)strtol(argv[3], NULL, 0));
-	printf("[OK] target_des_addr: 0x%08X\n", target_des_addr);
+	APP_DBG(DEBUG_LEVEL_INFO, "target_des_addr: 0x%08X\n", target_des_addr);
 
 	/* configure timer */
 	struct sigevent sev;
@@ -187,12 +285,16 @@ int main(int argc, char *argv[]) {
 	 * check device path
 	 */
 	uart_boot_dev_path.assign(argv[1]);
+	flash_set_state(FLASH_STATE_OPEN_UART, "opening serial device");
 
 	if (uart_boot_dev_opentty(uart_boot_dev_path.c_str()) < 0) {
-		cout << "[ERR] " << "Can't open dev path:" << uart_boot_dev_path.c_str() << endl;
-		exit(-1);
+		flash_set_state(FLASH_STATE_FAILED, "cannot open serial device");
+		APP_DBG(DEBUG_LEVEL_ERROR, "uart_boot_dev_opentty failed: dev=%s errno=%d (%s)\n", uart_boot_dev_path.c_str(), errno, strerror(errno));
+		APP_DBG(DEBUG_LEVEL_ERROR, "Can't open dev path: %s\n", uart_boot_dev_path.c_str());
+		exit(0);
 	}
 	else {
+		APP_DBG(DEBUG_LEVEL_INFO, "uart (%s) opened successfully\n", uart_boot_dev_path.c_str());
 		pthread_create(&uart_boot_rx_thread, NULL, uart_boot_rx_thread_handler, NULL);
 	}
 
@@ -222,31 +324,44 @@ void timer_handler(int sig, siginfo_t *si, void *uc) {
 					uart_boot_cmd_handshake_req(NULL);
 					pthread_mutex_lock(&uart_boot_to.mt);
 
-					cout << "\r[WRN] " << "handshake retry times " << std::dec << handshake_req_retry_counter << "!" << endl;
+					APP_DBG(DEBUG_LEVEL_WARN, "handshake retry times %u!\n", handshake_req_retry_counter);
 				}
 				else {
-					cout << "[ERR] " << "handshake faulted !" << endl;
-					cout << "[ERR] " << "Please check boot condition !" << endl;
-					exit(-1);
+					flash_set_state(FLASH_STATE_FAILED, "handshake timeout");
+					APP_DBG(DEBUG_LEVEL_ERROR, "handshake timeout exceeded: retries=%u\n", handshake_req_retry_counter);
+					APP_DBG(DEBUG_LEVEL_ERROR, "handshake faulted !\n");
+					APP_DBG(DEBUG_LEVEL_WARN,
+							"Please change boot mode:\n"
+							"\t- Press and hold [MODE] + [RESET] buttons\n"
+							"\t- Release [RESET] first (keep holding [MODE])\n"
+							"\t- If [LIFE LED] blinks rapidly, boot mode change is successful\n"
+							"\t- Then retry firmware update\n");
+					exit(0);
 				}
 			}
 				break;
 
 			case UART_BOOT_CMD_UPDATE_REQ_SIG_TO: {
-				cout << "[ERR] " << "UART_BOOT_CMD_UPDATE_REQ_SIG_TO" << endl;
-				exit(-1);
+				flash_set_state(FLASH_STATE_FAILED, "update request timeout");
+				APP_DBG(DEBUG_LEVEL_ERROR, "timeout: UART_BOOT_CMD_UPDATE_REQ_SIG_TO\n");
+				APP_DBG(DEBUG_LEVEL_ERROR, "UART_BOOT_CMD_UPDATE_REQ_SIG_TO\n");
+				exit(0);
 			}
 				break;
 
 			case UART_BOOT_CMD_TRANSFER_FW_REQ_SIG_TO: {
-				cout << "[ERR] " << "UART_BOOT_CMD_TRANSFER_FW_REQ_SIG_TO" << endl;
-				exit(-1);
+				flash_set_state(FLASH_STATE_FAILED, "transfer request timeout");
+				APP_DBG(DEBUG_LEVEL_ERROR, "timeout: UART_BOOT_CMD_TRANSFER_FW_REQ_SIG_TO\n");
+				APP_DBG(DEBUG_LEVEL_ERROR, "UART_BOOT_CMD_TRANSFER_FW_REQ_SIG_TO\n");
+				exit(0);
 			}
 				break;
 
 			case UART_BOOT_CMD_CHECKSUM_FW_REQ_SIG_TO: {
-				cout << "[ERR] " << "UART_BOOT_CMD_CHECKSUM_FW_REQ_SIG_TO" << endl;
-				exit(-1);
+				flash_set_state(FLASH_STATE_FAILED, "checksum request timeout");
+				APP_DBG(DEBUG_LEVEL_ERROR, "timeout: UART_BOOT_CMD_CHECKSUM_FW_REQ_SIG_TO\n");
+				APP_DBG(DEBUG_LEVEL_ERROR, "UART_BOOT_CMD_CHECKSUM_FW_REQ_SIG_TO\n");
+				exit(0);
 			}
 				break;
 
@@ -328,8 +443,8 @@ int uart_boot_dev_opentty(const char* devpath) {
 		pclose(st_sys_ret_fp);
 	}
 	else {
-		cout << "[ERR] " << "popen( " << "readlink -f " << devpath << " )" << endl;
-		exit(1);
+		APP_DBG(DEBUG_LEVEL_ERROR, "popen(readlink -f %s) failed\n", devpath);
+		exit(0);
 	}
 
 	st_devconflict.assign("");
@@ -351,20 +466,20 @@ int uart_boot_dev_opentty(const char* devpath) {
 			pclose(st_sys_ret_fp);
 		}
 		else {
-			cout << "[ERR] " << "popen( " << "readlink -f " << st_realdevpath << " )" << endl;
-			exit(1);
+			APP_DBG(DEBUG_LEVEL_ERROR, "popen(readlink -f %s) failed\n", st_realdevpath.c_str());
+			exit(0);
 		}
 
 		std::vector<std::string> vector_ret_lines;
 		extract_complete_lines(st_devconflict, vector_ret_lines);
 
 		if (vector_ret_lines.size() > 3) { // Note: in read application, set is > 3
-			cout << "\n[ERR] " << "Device is busy now, Please check !\n" << endl;
+			APP_DBG(DEBUG_LEVEL_ERROR, "Device is busy now, Please check !\n");
 			for (auto line : vector_ret_lines) {
-				std::cout << line << '\n';
+				APP_DBG(DEBUG_LEVEL_INFO, "%s\n", line.c_str());
 			}
-			cout << "\n[HELP] " << "Using command fuser -k " << st_realdevpath << endl << endl;
-			exit(1);
+			APP_DBG(DEBUG_LEVEL_INFO, "Using command fuser -k %s\n", st_realdevpath.c_str());
+			exit(0);
 		}
 	}
 	else { /* using alias device name */
@@ -384,20 +499,20 @@ int uart_boot_dev_opentty(const char* devpath) {
 			pclose(st_sys_ret_fp);
 		}
 		else {
-			cout << "[ERR] " << "popen( " << "readlink -f " << devpath << " )" << endl;
-			exit(1);
+			APP_DBG(DEBUG_LEVEL_ERROR, "popen(readlink -f %s) failed\n", devpath);
+			exit(0);
 		}
 
 		std::vector<std::string> vector_ret_lines;
 		extract_complete_lines(st_devconflict, vector_ret_lines);
 
 		if (vector_ret_lines.size() > 3) {
-			cout << "\n[ERR] " << "Device is busy now, Please check !\n" << endl;
+			APP_DBG(DEBUG_LEVEL_ERROR, "Device is busy now, Please check !\n");
 			for (auto line : vector_ret_lines) {
-				std::cout << line << '\n';
+				APP_DBG(DEBUG_LEVEL_INFO, "%s\n", line.c_str());
 			}
-			cout << "\n[HELP] " << "Using command fuser -k " << devpath << endl << endl;
-			exit(1);
+			APP_DBG(DEBUG_LEVEL_INFO, "Using command fuser -k %s\n", devpath);
+			exit(0);
 		}
 
 		command.assign("ps -ef | grep  ");
@@ -417,20 +532,20 @@ int uart_boot_dev_opentty(const char* devpath) {
 			pclose(st_sys_ret_fp);
 		}
 		else {
-			cout << "[ERR] " << "popen( " << "readlink -f " << st_realdevpath << " )" << endl;
-			exit(1);
+			APP_DBG(DEBUG_LEVEL_ERROR, "popen(readlink -f %s) failed\n", st_realdevpath.c_str());
+			exit(0);
 		}
 
 		vector_ret_lines.clear();
 		extract_complete_lines(st_devconflict, vector_ret_lines);
 
 		if (vector_ret_lines.size() > 2) {
-			cout << "\n[ERR] " << "Device is busy now, Please check !\n" << endl;
+			APP_DBG(DEBUG_LEVEL_ERROR, "Device is busy now, Please check !\n");
 			for (auto line : vector_ret_lines) {
-				std::cout << line << '\n';
+				APP_DBG(DEBUG_LEVEL_INFO, "%s\n", line.c_str());
 			}
-			cout << "\n[HELP] " << "Using command fuser -k " << st_realdevpath << endl << endl;
-			exit(1);
+			APP_DBG(DEBUG_LEVEL_INFO, "Using command fuser -k %s\n", st_realdevpath.c_str());
+			exit(0);
 		}
 	}
 
@@ -441,6 +556,8 @@ int uart_boot_dev_opentty(const char* devpath) {
 #endif
 
 	if (uart_boot_dev_fd < 0) {
+		flash_set_state(FLASH_STATE_FAILED, "open tty failed");
+		APP_DBG(DEBUG_LEVEL_ERROR, "open tty failed: dev=%s errno=%d (%s)\n", devpath, errno, strerror(errno));
 		return uart_boot_dev_fd;
 	}
 	else {
@@ -465,8 +582,10 @@ int uart_boot_dev_opentty(const char* devpath) {
 
 		tcflush(uart_boot_dev_fd, TCIFLUSH);
 		if (tcsetattr (uart_boot_dev_fd, TCSANOW, &options) != 0) {
-			cout << "[ERR] " << "error in tcsetattr()" << endl;
-			exit(-1);
+			flash_set_state(FLASH_STATE_FAILED, "configure tty failed");
+			APP_DBG(DEBUG_LEVEL_ERROR, "tcsetattr failed: dev=%s errno=%d (%s)\n", devpath, errno, strerror(errno));
+			APP_DBG(DEBUG_LEVEL_ERROR, "error in tcsetattr()\n");
+			exit(0);
 		}
 	}
 
@@ -491,8 +610,10 @@ void rx_frame_parser(uint8_t* data, uint8_t len) {
 			break;
 
 		case LEN_STATE: {
-			if (ch > UART_BOOT_FRAME_DATA_SIZE) {
+			if (ch == 0 || ch > UART_BOOT_FRAME_DATA_SIZE) {
 				uart_boot_frame.state = SOP_STATE;
+				uart_boot_frame.len = 0;
+				uart_boot_frame.index = 0;
 				return;
 			}
 			else {
@@ -504,17 +625,41 @@ void rx_frame_parser(uint8_t* data, uint8_t len) {
 			break;
 
 		case DATA_STATE: {
+			if (uart_boot_frame.index >= uart_boot_frame.len
+					|| uart_boot_frame.index >= UART_BOOT_FRAME_DATA_SIZE) {
+				uart_boot_frame.state = SOP_STATE;
+				uart_boot_frame.len = 0;
+				uart_boot_frame.index = 0;
+				return;
+			}
+
 			uart_boot_frame.data[uart_boot_frame.index++] = ch;
 
 			rx_remain = uart_boot_frame.len - uart_boot_frame.index;
+			if (rx_remain <= 0) {
+				uart_boot_frame.state = FCS_STATE;
+				break;
+			}
 
 			if (len >= rx_remain) {
+				if ((uart_boot_frame.index + rx_remain) > UART_BOOT_FRAME_DATA_SIZE) {
+					uart_boot_frame.state = SOP_STATE;
+					uart_boot_frame.len = 0;
+					uart_boot_frame.index = 0;
+					return;
+				}
 				memcpy((uint8_t*)(uart_boot_frame.data + uart_boot_frame.index), data, rx_remain);
 				uart_boot_frame.index += rx_remain;
 				len -= rx_remain;
 				data += rx_remain;
 			}
 			else {
+				if ((uart_boot_frame.index + len) > UART_BOOT_FRAME_DATA_SIZE) {
+					uart_boot_frame.state = SOP_STATE;
+					uart_boot_frame.len = 0;
+					uart_boot_frame.index = 0;
+					return;
+				}
 				memcpy((uint8_t*)(uart_boot_frame.data + uart_boot_frame.index), data, len);
 				uart_boot_frame.index += len;
 				len = 0;
@@ -535,20 +680,22 @@ void rx_frame_parser(uint8_t* data, uint8_t len) {
 					== uart_boot_calcfcs(uart_boot_frame.len, uart_boot_frame.data)) {
 
 #if defined(FRAME_DEBUG_EN)
-				cout << "[OK] " << "checksum correctly !" << endl;
-				cout << "[RX_DATA] [";
+				APP_DBG(DEBUG_LEVEL_DEBUG, "checksum correctly !\n");
+				APP_DBG(DEBUG_LEVEL_DEBUG, "[RX_DATA] [");
 				for (int i = 0; i < uart_boot_frame.len; i++) {
-					cout << ' ' << std::hex << uart_boot_frame.data[i];
+					APP_DBG(DEBUG_LEVEL_DEBUG, " %02X", uart_boot_frame.data[i]);
 				}
-				cout << " ]" << endl;
+				APP_DBG(DEBUG_LEVEL_DEBUG, " ]\n");
 #endif
 
 				uart_boot_frame.uart_boot_cmd_handler((uart_boot_frame_t*)&uart_boot_frame);
 			}
 			else {
 				/* TODO: handle checksum incorrect */
-				cout << "[ERR] " << "checksum incorrectly !" << endl;
-				exit(-1);
+				flash_set_state(FLASH_STATE_FAILED, "frame checksum incorrect");
+				APP_DBG(DEBUG_LEVEL_ERROR, "frame checksum incorrect: len=%u recv_fcs=0x%02X calc_fcs=0x%02X\n", uart_boot_frame.len, uart_boot_frame.fcs, uart_boot_calcfcs(uart_boot_frame.len, uart_boot_frame.data));
+				APP_DBG(DEBUG_LEVEL_ERROR, "checksum incorrectly !\n");
+				exit(0);
 			}
 		}
 			break;
@@ -587,15 +734,15 @@ void tx_frame_post(uart_boot_data_cmd_t* cmd) {
 	write(uart_boot_dev_fd, &fcs, 1);
 
 #if defined(FRAME_DEBUG_EN)
-	printf("[START-FRAME ------------------]\n");
-	printf("SOP: %02X\n", sop);
-	printf("LEN: %d\n", len);
-	printf("DAT: ");
+	APP_DBG(DEBUG_LEVEL_DEBUG, "[START-FRAME ------------------]\n");
+	APP_DBG(DEBUG_LEVEL_DEBUG, "SOP: %02X\n", sop);
+	APP_DBG(DEBUG_LEVEL_DEBUG, "LEN: %d\n", len);
+	APP_DBG(DEBUG_LEVEL_DEBUG, "DAT: ");
 	for (int i = 0; i < len; i++) {
-		printf("%02X ", ((uint8_t*)cmd)[i]);
+		APP_DBG(DEBUG_LEVEL_DEBUG, "%02X ", ((uint8_t*)cmd)[i]);
 	}
-	printf("\nFCS: %02X\n", fcs);
-	printf("[STOP-FRAME  ------------------]\n");
+	APP_DBG(DEBUG_LEVEL_DEBUG, "\nFCS: %02X\n", fcs);
+	APP_DBG(DEBUG_LEVEL_DEBUG, "[STOP-FRAME  ------------------]\n");
 #endif
 }
 
@@ -605,9 +752,9 @@ void* uart_boot_rx_thread_handler(void*) {
 	uint32_t rx_read_len;
 
 #if 1 // Trigger go to boot mode via console comment
-	const char* fwu = "fwu\r\n";
+	const char* fwu = "\nfwu\r\n";
 	write(uart_boot_dev_fd, fwu, strlen(fwu));
-	usleep(200000);
+	usleep(200000); // 200ms
 #endif
 
 #if 0 // Trigger go to boot mode via ak message format
@@ -630,6 +777,9 @@ void* uart_boot_rx_thread_handler(void*) {
 }
 
 void uart_boot_cmd_handshake_req(void* boot_obj) {
+	flash_set_state(FLASH_STATE_HANDSHAKE, "sending handshake request");
+	(void)boot_obj;
+
 	uart_boot_data_cmd_t uart_boot_data_cmd;
 	uart_boot_data_cmd.boot_cmd.cmd = UART_BOOT_CMD_HANDSHAKE_REQ;
 	uart_boot_data_cmd.boot_cmd.subcmd = 0;
@@ -658,15 +808,20 @@ void uart_boot_cmd_handshake_res(void* boot_obj) {
 	uart_boot_data_cmd_t* boot_cmd = (uart_boot_data_cmd_t*)(uart_boot_frame->data);
 
 	if (boot_cmd->boot_cmd.cmd == UART_BOOT_CMD_HANDSHAKE_RES) {
+		APP_DBG(DEBUG_LEVEL_INFO, "handshake completed successfully\n");
 		uart_boot_cmd_update_req(NULL);
 	}
 	else {
-		cout << "[ERR] " << "unexpected command !" << endl;
-		exit(-1);
+		flash_set_state(FLASH_STATE_FAILED, "unexpected handshake response");
+		APP_DBG(DEBUG_LEVEL_ERROR, "unexpected handshake response cmd=0x%02X\n", boot_cmd->boot_cmd.cmd);
+		APP_DBG(DEBUG_LEVEL_ERROR, "unexpected command !\n");
+		exit(0);
 	}
 }
 
 void uart_boot_cmd_update_req(void*) {
+	flash_set_state(FLASH_STATE_ERASE_FLASH, "requesting flash erase");
+
 	uart_boot_data_cmd_t uart_boot_data_cmd;
 
 	uart_boot_data_cmd.boot_cmd.cmd = UART_BOOT_CMD_UPDATE_REQ;
@@ -691,21 +846,26 @@ void uart_boot_cmd_update_res(void* boot_obj) {
 		if (boot_cmd->boot_cmd.subcmd == UART_BOOT_SUB_CMD_1) {
 			uint32_t erase_addr;
 			memcpy(&erase_addr, boot_cmd->data, sizeof(uint32_t));
-			printf("\rFlash page at addr: 0x%08x erased", erase_addr);
+			printf("\r[ERASE] Flash page at addr: 0x%08x erased", erase_addr);
 		}
 		else if (boot_cmd->boot_cmd.subcmd == UART_BOOT_SUB_CMD_2) {
 			printf("\n");
+			APP_DBG(DEBUG_LEVEL_INFO, "flash erase completed, start firmware transfer\n");
 			uart_boot_cmd_transfer_fw_req(NULL);
 			uart_boot_frame.uart_boot_cmd_handler = uart_boot_cmd_transfer_fw_res;
 		}
 		else {
-			cout << "[ERR] " << "unexpected sub command !" << endl;
-			exit(-1);
+			flash_set_state(FLASH_STATE_FAILED, "unexpected update sub command");
+			APP_DBG(DEBUG_LEVEL_ERROR, "unexpected update subcmd=0x%02X\n", boot_cmd->boot_cmd.subcmd);
+			APP_DBG(DEBUG_LEVEL_ERROR, "unexpected sub command !\n");
+			exit(0);
 		}
 	}
 	else {
-		cout << "[ERR] " << "unexpected command !" << endl;
-		exit(-1);
+		flash_set_state(FLASH_STATE_FAILED, "unexpected update response");
+		APP_DBG(DEBUG_LEVEL_ERROR, "unexpected update response cmd=0x%02X\n", boot_cmd->boot_cmd.cmd);
+		APP_DBG(DEBUG_LEVEL_ERROR, "unexpected command !\n");
+		exit(0);
 	}
 }
 
@@ -716,6 +876,11 @@ static uint32_t firmware_transfer_remain = 0;
 static uint32_t firmware_transfer_index = 0;
 
 void uart_boot_cmd_transfer_fw_req(void*) {
+	if (current_flash_state != FLASH_STATE_TRANSFER_FIRMWARE) {
+		flash_set_state(FLASH_STATE_TRANSFER_FIRMWARE, "transferring firmware data");
+		// Info: frame size
+	}
+
 	firmware_transfer_remain = file_firmware_header.bin_len - firmware_transfer_index;
 
 	if (firmware_transfer_remain <= UART_BOOT_CMD_DATA_SIZE) {
@@ -748,12 +913,13 @@ void uart_boot_cmd_transfer_fw_req(void*) {
 		print_progress(percent, &transfer_fw_status);
 
 		if ((int)percent == 1) {
-			printf("\n");
+			APP_DBG(DEBUG_LEVEL_INFO, "\n");
 		}
 
 		if (firmware_transfer_index >= file_firmware_header.bin_len) checksum_flag = 1;
 	}
 	else {
+		flash_set_state(FLASH_STATE_VERIFY_CHECKSUM, "sending checksum request");
 		uart_boot_cmd_checksum_fw_req(NULL);
 		uart_boot_frame.uart_boot_cmd_handler = uart_boot_cmd_checksum_fw_res;
 	}
@@ -769,8 +935,10 @@ void uart_boot_cmd_transfer_fw_res(void* boot_obj) {
 		uart_boot_cmd_transfer_fw_req(NULL);
 	}
 	else {
-		cout << "[ERR] " << "unexpected command !" << endl;
-		exit(-1);
+		flash_set_state(FLASH_STATE_FAILED, "unexpected transfer response");
+		APP_DBG(DEBUG_LEVEL_ERROR, "unexpected transfer response cmd=0x%02X\n", boot_cmd->cmd);
+		APP_DBG(DEBUG_LEVEL_ERROR, "unexpected command !\n");
+		exit(0);
 	}
 }
 
@@ -792,20 +960,28 @@ void uart_boot_cmd_checksum_fw_res(void* boot_obj) {
 
 	if (boot_cmd->cmd == UART_BOOT_CMD_CHECKSUM_FW_RES) {
 		if (boot_cmd->subcmd == UART_BOOT_SUB_CMD_1) {
-			cout << "[OK] " << "Update firmware successfully !" << endl;
+			APP_DBG(DEBUG_LEVEL_INFO, "checksum OK\n");
+			flash_set_state(FLASH_STATE_COMPLETE, "firmware update completed");
 		}
 		else if (boot_cmd->subcmd == UART_BOOT_SUB_CMD_2) {
-			cout << "[ERR] " << "Target checksum incorrectly !" << endl;
-			exit(-1);
+			APP_DBG(DEBUG_LEVEL_ERROR, "checksum FAIL\n");
+			flash_set_state(FLASH_STATE_FAILED, "target checksum mismatch");
+			APP_DBG(DEBUG_LEVEL_ERROR, "target checksum mismatch\n");
+			APP_DBG(DEBUG_LEVEL_ERROR, "Target checksum incorrectly !\n");
+			exit(0);
 		}
 		else {
-			cout << "[ERR] " << "unexpected sub command !" << endl;
-			exit(-1);
+			flash_set_state(FLASH_STATE_FAILED, "unexpected checksum sub command");
+			APP_DBG(DEBUG_LEVEL_ERROR, "unexpected checksum subcmd=0x%02X\n", boot_cmd->subcmd);
+			APP_DBG(DEBUG_LEVEL_ERROR, "unexpected sub command !\n");
+			exit(0);
 		}
 	}
 	else {
-		cout << "[ERR] " << "unexpected command !" << endl;
-		exit(-1);
+		flash_set_state(FLASH_STATE_FAILED, "unexpected checksum response");
+		APP_DBG(DEBUG_LEVEL_ERROR, "unexpected checksum response cmd=0x%02X\n", boot_cmd->cmd);
+		APP_DBG(DEBUG_LEVEL_ERROR, "unexpected command !\n");
+		exit(0);
 	}
 
 	exit(0);
