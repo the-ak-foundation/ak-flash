@@ -1,5 +1,5 @@
 # AK - Flash
-[<img src="https://github.com/ak-embedded-software/ak-base-kit-stm32l151/blob/main/hardware/images/ak-embedded-software-logo.jpg" width="240"/>](https://github.com/ak-embedded-software/ak-base-kit-stm32l151/blob/main/hardware/images/ak-embedded-software-logo.jpg)
+[<img src="https://github.com/the-ak-foundation/ak-base-kit-stm32l151/blob/main/hardware/images/ak-foundation-logo.png" width="240"/>](https://github.com/the-ak-foundation)
 
 The application runs on the host PC or on the embedded computer like Raspberry Pi, helping to update firmware via Serial (UART) for microcontroller devices (MCU) using [AK Embedded Base Source](https://github.com/ak-embedded-software/ak-base-kit-stm32l151).
 
