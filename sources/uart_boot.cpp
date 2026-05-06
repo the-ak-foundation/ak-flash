@@ -194,6 +194,7 @@ static void uart_boot_clear_to();
 #define UART_BOOT_CMD_CHECKSUM_FW_REQ_SIG_INTERVAL	5
 
 #define HANDSHAKE_REQ_RETRY_COUNTER_MAX				3 /* ~ 6s */
+#define UART_OPEN_RETRY_COUNTER_MAX					3 /* ~ 3s */
 
 static void uart_boot_cmd_handshake_req(void*);
 static void uart_boot_cmd_handshake_res(void*);
@@ -289,7 +290,7 @@ int main(int argc, char *argv[]) {
 
 	if (uart_boot_dev_opentty(uart_boot_dev_path.c_str()) < 0) {
 		flash_set_state(FLASH_STATE_FAILED, "cannot open serial device");
-		APP_DBG(DEBUG_LEVEL_ERROR, "uart_boot_dev_opentty failed: dev=%s errno=%d (%s)\n", uart_boot_dev_path.c_str(), errno, strerror(errno));
+		// APP_DBG(DEBUG_LEVEL_ERROR, "uart_boot_dev_opentty failed: dev=%s errno=%d (%s)\n", uart_boot_dev_path.c_str(), errno, strerror(errno));
 		APP_DBG(DEBUG_LEVEL_ERROR, "Can't open dev path: %s\n", uart_boot_dev_path.c_str());
 		exit(0);
 	}
@@ -552,7 +553,15 @@ int uart_boot_dev_opentty(const char* devpath) {
 	uart_boot_dev_fd = open(st_realdevpath.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
 
 #else
-	uart_boot_dev_fd = open(devpath, O_RDWR | O_NOCTTY | O_NDELAY);
+	for(int i = 0; i < UART_OPEN_RETRY_COUNTER_MAX; i++) {
+		uart_boot_dev_fd = open(devpath, O_RDWR | O_NOCTTY | O_NDELAY);
+		if (uart_boot_dev_fd >= 0) {
+			break;
+		}
+
+		APP_DBG(DEBUG_LEVEL_WARN, "open %s failed, retry times %u!\n", devpath, i+1);
+		sleep(1);
+	}
 #endif
 
 	if (uart_boot_dev_fd < 0) {
